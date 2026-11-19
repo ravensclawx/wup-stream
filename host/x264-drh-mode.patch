@@ -1,0 +1,158 @@
+diff --git a/common/base.c b/common/base.c
+index 3427727..2f8b5f9 100644
+--- a/common/base.c
++++ b/common/base.c
+@@ -989,6 +989,8 @@ REALIGN_STACK int x264_param_parse( x264_param_t *p, const char *name, const cha
+     }
+     OPT("bluray-compat")
+         p->b_bluray_compat = atobool(value);
++    OPT("drh-mode")
++        p->b_drh_mode = atobool(value);
+     OPT("avcintra-class")
+         p->i_avcintra_class = atoi(value);
+     OPT("avcintra-flavor")
+@@ -1481,6 +1483,8 @@ char *x264_param2string( x264_param_t *p, int b_res )
+     s += sprintf( s, " decimate=%d", p->analyse.b_dct_decimate );
+     s += sprintf( s, " interlaced=%s", p->b_interlaced ? p->b_tff ? "tff" : "bff" : p->b_fake_interlaced ? "fake" : "0" );
+     s += sprintf( s, " bluray_compat=%d", p->b_bluray_compat );
++    if( p->b_drh_mode )
++        s += sprintf( s, " drh_mode=1" );
+     if( p->b_stitchable )
+         s += sprintf( s, " stitchable=%d", p->b_stitchable );
+ 
+diff --git a/encoder/analyse.c b/encoder/analyse.c
+index adb63e1..6873a9b 100644
+--- a/encoder/analyse.c
++++ b/encoder/analyse.c
+@@ -621,14 +621,23 @@ static void mb_analyse_intra_chroma( x264_t *h, x264_mb_analysis_t *a )
+         int satdu[4], satdv[4];
+         h->pixf.intra_mbcmp_x3_chroma( h->mb.pic.p_fenc[1], h->mb.pic.p_fdec[1], satdu );
+         h->pixf.intra_mbcmp_x3_chroma( h->mb.pic.p_fenc[2], h->mb.pic.p_fdec[2], satdv );
+-        h->predict_chroma[I_PRED_CHROMA_P]( h->mb.pic.p_fdec[1] );
+-        h->predict_chroma[I_PRED_CHROMA_P]( h->mb.pic.p_fdec[2] );
+-        satdu[I_PRED_CHROMA_P] = h->pixf.mbcmp[chromapix]( h->mb.pic.p_fenc[1], FENC_STRIDE, h->mb.pic.p_fdec[1], FDEC_STRIDE );
+-        satdv[I_PRED_CHROMA_P] = h->pixf.mbcmp[chromapix]( h->mb.pic.p_fenc[2], FENC_STRIDE, h->mb.pic.p_fdec[2], FDEC_STRIDE );
++        /* DRH: the GamePad decoder cannot decode planar prediction */
++        if( !h->param.b_drh_mode )
++        {
++            h->predict_chroma[I_PRED_CHROMA_P]( h->mb.pic.p_fdec[1] );
++            h->predict_chroma[I_PRED_CHROMA_P]( h->mb.pic.p_fdec[2] );
++            satdu[I_PRED_CHROMA_P] = h->pixf.mbcmp[chromapix]( h->mb.pic.p_fenc[1], FENC_STRIDE, h->mb.pic.p_fdec[1], FDEC_STRIDE );
++            satdv[I_PRED_CHROMA_P] = h->pixf.mbcmp[chromapix]( h->mb.pic.p_fenc[2], FENC_STRIDE, h->mb.pic.p_fdec[2], FDEC_STRIDE );
++        }
+ 
+         for( ; *predict_mode >= 0; predict_mode++ )
+         {
+             int i_mode = *predict_mode;
++            if( h->param.b_drh_mode && i_mode == I_PRED_CHROMA_P )
++            {
++                a->i_satd_chroma_dir[i_mode] = COST_MAX;
++                continue;
++            }
+             int i_satd = satdu[i_mode] + satdv[i_mode] + a->i_lambda * bs_size_ue( i_mode );
+ 
+             a->i_satd_chroma_dir[i_mode] = i_satd;
+@@ -641,6 +650,11 @@ static void mb_analyse_intra_chroma( x264_t *h, x264_mb_analysis_t *a )
+         {
+             int i_satd;
+             int i_mode = *predict_mode;
++            if( h->param.b_drh_mode && i_mode == I_PRED_CHROMA_P )
++            {
++                a->i_satd_chroma_dir[i_mode] = COST_MAX;
++                continue;
++            }
+ 
+             /* we do the prediction */
+             if( h->mb.b_lossless )
+@@ -706,7 +720,8 @@ static void mb_analyse_intra( x264_t *h, x264_mb_analysis_t *a, int i_satd_inter
+             COPY2_IF_LT( a->i_satd_i16x16, a->i_satd_i16x16_dir[2], a->i_predict16x16, 2 );
+ 
+             /* Plane is expensive, so don't check it unless one of the previous modes was useful. */
+-            if( a->i_satd_i16x16 <= i16x16_thresh )
++            a->i_satd_i16x16_dir[I_PRED_16x16_P] = COST_MAX;
++            if( !h->param.b_drh_mode && a->i_satd_i16x16 <= i16x16_thresh )
+             {
+                 h->predict_16x16[I_PRED_16x16_P]( p_dst );
+                 a->i_satd_i16x16_dir[I_PRED_16x16_P] = h->pixf.mbcmp[PIXEL_16x16]( p_src, FENC_STRIDE, p_dst, FDEC_STRIDE );
+@@ -720,6 +735,11 @@ static void mb_analyse_intra( x264_t *h, x264_mb_analysis_t *a, int i_satd_inter
+             {
+                 int i_satd;
+                 int i_mode = *predict_mode;
++                if( h->param.b_drh_mode && i_mode == I_PRED_16x16_P )
++                {
++                    a->i_satd_i16x16_dir[i_mode] = COST_MAX;
++                    continue;
++                }
+ 
+                 if( h->mb.b_lossless )
+                     x264_predict_lossless_16x16( h, 0, i_mode );
+@@ -1030,6 +1050,8 @@ static void intra_rd_refine( x264_t *h, x264_mb_analysis_t *a )
+             int i_mode = *predict_mode;
+             if( i_mode == old_pred_mode || a->i_satd_i16x16_dir[i_mode] > i_thresh )
+                 continue;
++            if( h->param.b_drh_mode && i_mode == I_PRED_16x16_P )
++                continue;
+             h->mb.i_intra16x16_pred_mode = i_mode;
+             i_satd = rd_cost_mb( h, a->i_lambda2 );
+             COPY2_IF_LT( i_best, i_satd, a->i_predict16x16, i_mode );
+@@ -1049,6 +1071,8 @@ static void intra_rd_refine( x264_t *h, x264_mb_analysis_t *a )
+             for( i_max = 0; *predict_mode >= 0; predict_mode++ )
+             {
+                 int i_mode = *predict_mode;
++                if( h->param.b_drh_mode && i_mode == I_PRED_CHROMA_P )
++                    continue;
+                 if( a->i_satd_chroma_dir[i_mode] < i_thresh && i_mode != a->i_predict8x8chroma )
+                     predict_mode_sorted[i_max++] = i_mode;
+             }
+diff --git a/encoder/encoder.c b/encoder/encoder.c
+index 20e620a..ab12573 100644
+--- a/encoder/encoder.c
++++ b/encoder/encoder.c
+@@ -1385,6 +1385,7 @@ static int validate_parameters( x264_t *h, int b_open )
+     BOOLIFY( b_fake_interlaced );
+     BOOLIFY( b_open_gop );
+     BOOLIFY( b_bluray_compat );
++    BOOLIFY( b_drh_mode );
+     BOOLIFY( b_stitchable );
+     BOOLIFY( b_full_recon );
+     BOOLIFY( b_opencl );
+@@ -2786,9 +2787,13 @@ static intptr_t slice_write( x264_t *h )
+     h->mb.i_mb_xy = h->sh.i_first_mb;
+     h->sh.i_qp = x264_ratecontrol_mb_qp( h );
+     h->sh.i_qp = SPEC_QP( h->sh.i_qp );
++    if( h->param.b_drh_mode )
++        h->sh.i_qp = 32 + QP_BD_OFFSET;              /* GamePad: slice QP fixed, mb_qp_delta carries the rest */
+     h->sh.i_qp_delta = h->sh.i_qp - h->pps->i_pic_init_qp;
+ 
+-    slice_header_write( &h->out.bs, &h->sh, h->i_nal_ref_idc );
++    /* GamePad (DRC) decoder: the slice data follows the NAL header directly */
++    if( !h->param.b_drh_mode )
++        slice_header_write( &h->out.bs, &h->sh, h->i_nal_ref_idc );
+     if( h->param.b_cabac )
+     {
+         /* alignment needed */
+diff --git a/encoder/set.c b/encoder/set.c
+index ec47193..26dad64 100644
+--- a/encoder/set.c
++++ b/encoder/set.c
+@@ -492,6 +492,8 @@ void x264_pps_init( x264_pps_t *pps, int i_id, x264_param_t *param, x264_sps_t *
+     pps->b_weighted_bipred = param->analyse.b_weighted_bipred ? 2 : 0;
+ 
+     pps->i_pic_init_qp = param->rc.i_rc_method == X264_RC_ABR || param->b_stitchable ? 26 + QP_BD_OFFSET : SPEC_QP( param->rc.i_qp_constant );
++    if( param->b_drh_mode )
++        pps->i_pic_init_qp = 32 + QP_BD_OFFSET;     /* the GamePad decoder assumes it */
+     pps->i_pic_init_qs = 26 + QP_BD_OFFSET;
+ 
+     pps->i_chroma_qp_index_offset = param->analyse.i_chroma_qp_offset;
+diff --git a/x264.h b/x264.h
+index cc22f05..f6655c9 100644
+--- a/x264.h
++++ b/x264.h
+@@ -368,6 +368,7 @@ typedef struct x264_param_t
+     int         i_bframe_pyramid;   /* Keep some B-frames as references: 0=off, 1=strict hierarchical, 2=normal */
+     int         b_open_gop;
+     int         b_bluray_compat;
++    int         b_drh_mode;         /* Wii U GamePad (DRC) decoder: no slice header, slice QP 32, no planar prediction */
+     int         i_avcintra_class;
+     int         i_avcintra_flavor;
+ 
